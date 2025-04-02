@@ -38,9 +38,17 @@
 #include "weston-test-runner.h"
 #include "weston-test-client-protocol.h"
 #include "viewporter-client-protocol.h"
+#include "weston-output-capture-client-protocol.h"
 
 struct client {
 	struct wl_display *wl_display;
+
+	/*
+	 * Have successfully received an expected protocol error, the
+	 * connection is in error state, and that is ok.
+	 */
+	bool errored_ok;
+
 	struct wl_registry *wl_registry;
 	struct wl_compositor *wl_compositor;
 	struct wl_shm *wl_shm;
@@ -57,7 +65,6 @@ struct client {
 	struct surface *surface;
 	int has_argb;
 	struct wl_list global_list;
-	bool has_wl_drm;
 	struct wl_list output_list; /* struct output::link */
 };
 
@@ -73,7 +80,6 @@ struct test {
 	int pointer_x;
 	int pointer_y;
 	uint32_t n_egl_buffers;
-	int buffer_copy_done;
 };
 
 struct input {
@@ -91,6 +97,7 @@ struct input {
 struct pointer {
 	struct wl_pointer *wl_pointer;
 	struct surface *focus;
+	uint32_t serial;
 	int x;
 	int y;
 	uint32_t button;
@@ -154,6 +161,8 @@ struct output {
 	int height;
 	int scale;
 	int initialized;
+	char *name;
+	char *desc;
 };
 
 struct buffer {
@@ -163,6 +172,8 @@ struct buffer {
 };
 
 struct surface {
+	struct client *client; /* not owned */
+
 	struct wl_surface *wl_surface;
 	struct output *output; /* not owned */
 	int x;
@@ -196,8 +207,15 @@ create_test_surface(struct client *client);
 void
 surface_destroy(struct surface *surface);
 
+void
+surface_set_opaque_rect(struct surface *surface, const struct rectangle *rect);
+
 struct client *
 create_client_and_test_surface(int x, int y, int width, int height);
+
+struct buffer *
+create_shm_buffer(struct client *client, int width, int height,
+		  uint32_t drm_format);
 
 struct buffer *
 create_shm_buffer_a8r8g8b8(struct client *client, int width, int height);
@@ -224,9 +242,6 @@ frame_callback_wait_nofail(struct client *client, int *done);
 #define frame_callback_wait(c, d) assert(frame_callback_wait_nofail((c), (d)))
 
 void
-skip(const char *fmt, ...);
-
-void
 expect_protocol_error(struct client *client,
 		      const struct wl_interface *intf, uint32_t code);
 
@@ -238,6 +253,9 @@ screenshot_reference_filename(const char *basename, uint32_t seq);
 
 char *
 image_filename(const char *basename);
+
+FILE *
+fopen_dump_file(const char *suffix);
 
 bool
 check_images_match(pixman_image_t *img_a, pixman_image_t *img_b,
@@ -256,14 +274,29 @@ pixman_image_t *
 load_image_from_png(const char *fname);
 
 struct buffer *
-capture_screenshot_of_output(struct client *client);
+capture_screenshot_of_output(struct client *client, const char *output_name);
+
+struct buffer *
+client_capture_output(struct client *client,
+		      struct output *output,
+		      enum weston_capture_v1_source src);
+
+pixman_image_t *
+image_convert_to_a8r8g8b8(pixman_image_t *image);
+
+bool
+verify_image(pixman_image_t *shot,
+	     const char *ref_image,
+	     int ref_seq_no,
+	     const struct rectangle *clip,
+	     int seq_no);
 
 bool
 verify_screen_content(struct client *client,
 		      const char *ref_image,
 		      int ref_seq_no,
 		      const struct rectangle *clip,
-		      int seq_no);
+		      int seq_no, const char *output_name);
 
 struct buffer *
 client_buffer_from_image_file(struct client *client,
@@ -279,7 +312,7 @@ struct wp_viewport *
 client_create_viewport(struct client *client);
 
 void
-fill_image_with_color(pixman_image_t *image, pixman_color_t *color);
+fill_image_with_color(pixman_image_t *image, const pixman_color_t *color);
 
 pixman_color_t *
 color_rgb888(pixman_color_t *tmp, uint8_t r, uint8_t g, uint8_t b);

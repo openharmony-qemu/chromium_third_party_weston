@@ -35,6 +35,7 @@ fixture_setup(struct weston_test_harness *harness)
 	struct compositor_setup setup;
 
 	compositor_setup_defaults(&setup);
+	setup.shell = SHELL_TEST_DESKTOP;
 
 	return weston_test_harness_execute_as_client(harness, &setup);
 }
@@ -108,6 +109,8 @@ TEST(test_surface_output)
 	/* visible */
 	check_client_move(client, x, --y);
 	assert(output_contains_client(client));
+
+	client_destroy(client);
 }
 
 static void
@@ -176,4 +179,9 @@ TEST(buffer_release)
 	assert(buf1_released == 0);
 	assert(buf2_released == 1);
 	assert(buf3_released == 1);
+
+	buffer_destroy(buf1);
+	buffer_destroy(buf2);
+	buffer_destroy(buf3);
+	client_destroy(client);
 }
