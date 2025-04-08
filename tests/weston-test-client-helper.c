@@ -37,10 +37,15 @@
 #include <cairo.h>
 
 #include "test-config.h"
+#include "pixel-formats.h"
+#include "shared/weston-drm-fourcc.h"
 #include "shared/os-compatibility.h"
+#include "shared/string-helpers.h"
 #include "shared/xalloc.h"
 #include <libweston/zalloc.h>
 #include "weston-test-client-helper.h"
+#include "image-iter.h"
+#include "weston-output-capture-client-protocol.h"
 
 #define max(a, b) (((a) > (b)) ? (a) : (b))
 #define min(a, b) (((a) > (b)) ? (b) : (a))
@@ -130,6 +135,7 @@ pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
 	else
 		pointer->focus = NULL;
 
+	pointer->serial = serial;
 	pointer->x = wl_fixed_to_int(x);
 	pointer->y = wl_fixed_to_int(y);
 
@@ -143,6 +149,7 @@ pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
 {
 	struct pointer *pointer = data;
 
+	pointer->serial = serial;
 	pointer->focus = NULL;
 
 	testlog("test-client: got pointer leave, surface %p\n",
@@ -172,6 +179,7 @@ pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
 {
 	struct pointer *pointer = data;
 
+	pointer->serial = serial;
 	pointer->button = button;
 	pointer->state = state;
 	pointer->button_time_msec = time_msec;
@@ -438,10 +446,11 @@ static const struct wl_surface_listener surface_listener = {
 	surface_leave
 };
 
-static struct buffer *
+struct buffer *
 create_shm_buffer(struct client *client, int width, int height,
-		  pixman_format_code_t format, uint32_t wlfmt)
+		  uint32_t drm_format)
 {
+	const struct pixel_format_info *pfmt;
 	struct wl_shm *shm = client->wl_shm;
 	struct buffer *buf;
 	size_t stride_bytes;
@@ -453,9 +462,13 @@ create_shm_buffer(struct client *client, int width, int height,
 	assert(width > 0);
 	assert(height > 0);
 
+	pfmt = pixel_format_get_info(drm_format);
+	assert(pfmt);
+	assert(pixel_format_get_plane_count(pfmt) == 1);
+
 	buf = xzalloc(sizeof *buf);
 
-	bytes_pp = PIXMAN_FORMAT_BPP(format) / 8;
+	bytes_pp = pfmt->bpp / 8;
 	stride_bytes = width * bytes_pp;
 	/* round up to multiple of 4 bytes for Pixman */
 	stride_bytes = (stride_bytes + 3) & ~3u;
@@ -475,11 +488,13 @@ create_shm_buffer(struct client *client, int width, int height,
 
 	pool = wl_shm_create_pool(shm, fd, buf->len);
 	buf->proxy = wl_shm_pool_create_buffer(pool, 0, width, height,
-					       stride_bytes, wlfmt);
+					       stride_bytes,
+					       pixel_format_get_shm_format(pfmt));
 	wl_shm_pool_destroy(pool);
 	close(fd);
 
-	buf->image = pixman_image_create_bits(format, width, height,
+	buf->image = pixman_image_create_bits(pfmt->pixman_format,
+					      width, height,
 					      data, stride_bytes);
 
 	assert(buf->proxy);
@@ -493,8 +508,23 @@ create_shm_buffer_a8r8g8b8(struct client *client, int width, int height)
 {
 	assert(client->has_argb);
 
-	return create_shm_buffer(client, width, height,
-				 PIXMAN_a8r8g8b8, WL_SHM_FORMAT_ARGB8888);
+	return create_shm_buffer(client, width, height, DRM_FORMAT_ARGB8888);
+}
+
+static struct buffer *
+create_pixman_buffer(int width, int height, pixman_format_code_t pixman_format)
+{
+	struct buffer *buf;
+
+	assert(width > 0);
+	assert(height > 0);
+
+	buf = xzalloc(sizeof *buf);
+	buf->image = pixman_image_create_bits(pixman_format,
+					      width, height, NULL, 0);
+	assert(buf->image);
+
+	return buf;
 }
 
 void
@@ -539,18 +569,8 @@ test_handle_pointer_position(void *data, struct weston_test *weston_test,
 		test->pointer_x, test->pointer_y);
 }
 
-static void
-test_handle_capture_screenshot_done(void *data, struct weston_test *weston_test)
-{
-	struct test *test = data;
-
-	testlog("Screenshot has been captured\n");
-	test->buffer_copy_done = 1;
-}
-
 static const struct weston_test_listener test_listener = {
 	test_handle_pointer_position,
-	test_handle_capture_screenshot_done,
 };
 
 static void
@@ -710,6 +730,20 @@ output_handle_scale(void *data,
 }
 
 static void
+output_handle_name(void *data, struct wl_output *wl_output, const char *name)
+{
+	struct output *output = data;
+	output->name = strdup(name);
+}
+
+static void
+output_handle_description(void *data, struct wl_output *wl_output, const char *desc)
+{
+	struct output *output = data;
+	output->desc = strdup(desc);
+}
+
+static void
 output_handle_done(void *data,
 		   struct wl_output *wl_output)
 {
@@ -723,6 +757,8 @@ static const struct wl_output_listener output_listener = {
 	output_handle_mode,
 	output_handle_done,
 	output_handle_scale,
+	output_handle_name,
+	output_handle_description,
 };
 
 static void
@@ -731,6 +767,8 @@ output_destroy(struct output *output)
 	assert(wl_proxy_get_version((struct wl_proxy *)output->wl_output) >= 3);
 	wl_output_release(output->wl_output);
 	wl_list_remove(&output->link);
+	free(output->name);
+	free(output->desc);
 	free(output);
 }
 
@@ -792,8 +830,6 @@ handle_global(void *data, struct wl_registry *registry,
 					 &weston_test_interface, version);
 		weston_test_add_listener(test->weston_test, &test_listener, test);
 		client->test = test;
-	} else if (strcmp(interface, "wl_drm") == 0) {
-		client->has_wl_drm = true;
 	}
 }
 
@@ -861,22 +897,6 @@ static const struct wl_registry_listener registry_listener = {
 };
 
 void
-skip(const char *fmt, ...)
-{
-	va_list argp;
-
-	va_start(argp, fmt);
-	vfprintf(stderr, fmt, argp);
-	va_end(argp);
-
-	/* automake tests uses exit code 77. weston-test-runner will see
-	 * this and use it, and then weston-test's sigchld handler (in the
-	 * weston process) will use that as an exit status, which is what
-	 * ninja will see in the end. */
-	exit(77);
-}
-
-void
 expect_protocol_error(struct client *client,
 		      const struct wl_interface *intf,
 		      uint32_t code)
@@ -920,6 +940,8 @@ expect_protocol_error(struct client *client,
 	/* all OK */
 	testlog("Got expected protocol error on '%s' (object id: %d) "
 		"with code %d\n", interface->name, id, errcode);
+
+	client->errored_ok = true;
 }
 
 static void
@@ -980,6 +1002,7 @@ create_test_surface(struct client *client)
 
 	surface = xzalloc(sizeof *surface);
 
+	surface->client = client;
 	surface->wl_surface =
 		wl_compositor_create_surface(client->wl_compositor);
 	assert(surface->wl_surface);
@@ -1000,6 +1023,17 @@ surface_destroy(struct surface *surface)
 	if (surface->buffer)
 		buffer_destroy(surface->buffer);
 	free(surface);
+}
+
+void
+surface_set_opaque_rect(struct surface *surface, const struct rectangle *rect)
+{
+	struct wl_region *region;
+
+	region = wl_compositor_create_region(surface->client->wl_compositor);
+	wl_region_add(region, rect->x, rect->y, rect->width, rect->height);
+	wl_surface_set_opaque_region(surface->wl_surface, region);
+	wl_region_destroy(region);
 }
 
 struct client *
@@ -1039,6 +1073,8 @@ create_client_and_test_surface(int x, int y, int width, int height)
 void
 client_destroy(struct client *client)
 {
+	int ret;
+
 	if (client->surface)
 		surface_destroy(client->surface);
 
@@ -1069,10 +1105,12 @@ client_destroy(struct client *client)
 	if (client->wl_registry)
 		wl_registry_destroy(client->wl_registry);
 
-	client_roundtrip(client);
-
-	if (client->wl_display)
+	if (client->wl_display) {
+		ret = wl_display_roundtrip(client->wl_display);
+		assert(client->errored_ok || ret >= 0);
 		wl_display_disconnect(client->wl_display);
+	}
+
 	free(client);
 }
 
@@ -1127,6 +1165,36 @@ image_filename(const char *basename)
 	if (asprintf(&filename, "%s/%s.png", reference_path(), basename) < 0)
 		assert(0);
 	return filename;
+}
+
+/** Open a writable file
+ *
+ * \param suffix Custom file name suffix.
+ * \return FILE pointer, or NULL on failure.
+ *
+ * The file name consists of output path, test name, and the given suffix.
+ * If environment variable WESTON_TEST_OUTPUT_PATH is set, it is used as the
+ * directory path, otherwise the current directory is used.
+ *
+ * The file will be writable. If it exists, it is truncated, otherwise it is
+ * created. Failures are logged.
+ */
+FILE *
+fopen_dump_file(const char *suffix)
+{
+	char *fname;
+	FILE *fp;
+
+	str_printf(&fname, "%s/%s-%s.txt", output_path(),
+		   get_test_name(), suffix);
+	fp = fopen(fname, "w");
+	if (!fp) {
+		testlog("Error: failed to open file '%s' for writing: %s\n",
+			fname, strerror(errno));
+	}
+	free(fname);
+
+	return fp;
 }
 
 struct format_map_entry {
@@ -1186,8 +1254,8 @@ range_get(const struct range *r)
 /**
  * Compute the ROI for image comparisons
  *
- * \param img_a An image.
- * \param img_b Another image.
+ * \param ih_a A header for an image.
+ * \param ih_b A header for another image.
  * \param clip_rect Explicit ROI, or NULL for using the whole
  * image area.
  *
@@ -1201,20 +1269,11 @@ range_get(const struct range *r)
  * The ROI is given as pixman_box32_t, where x2,y2 are non-inclusive.
  */
 static pixman_box32_t
-image_check_get_roi(pixman_image_t *img_a, pixman_image_t *img_b,
-		   const struct rectangle *clip_rect)
+image_check_get_roi(const struct image_header *ih_a,
+		    const struct image_header *ih_b,
+		    const struct rectangle *clip_rect)
 {
-	int width_a;
-	int width_b;
-	int height_a;
-	int height_b;
 	pixman_box32_t box;
-
-	width_a = pixman_image_get_width(img_a);
-	height_a = pixman_image_get_height(img_a);
-
-	width_b = pixman_image_get_width(img_b);
-	height_b = pixman_image_get_height(img_b);
 
 	if (clip_rect) {
 		box.x1 = clip_rect->x;
@@ -1224,43 +1283,20 @@ image_check_get_roi(pixman_image_t *img_a, pixman_image_t *img_b,
 	} else {
 		box.x1 = 0;
 		box.y1 = 0;
-		box.x2 = max(width_a, width_b);
-		box.y2 = max(height_a, height_b);
+		box.x2 = max(ih_a->width, ih_b->width);
+		box.y2 = max(ih_a->height, ih_b->height);
 	}
 
 	assert(box.x1 >= 0);
 	assert(box.y1 >= 0);
 	assert(box.x2 > box.x1);
 	assert(box.y2 > box.y1);
-	assert(box.x2 <= width_a);
-	assert(box.x2 <= width_b);
-	assert(box.y2 <= height_a);
-	assert(box.y2 <= height_b);
+	assert(box.x2 <= ih_a->width);
+	assert(box.x2 <= ih_b->width);
+	assert(box.y2 <= ih_a->height);
+	assert(box.y2 <= ih_b->height);
 
 	return box;
-}
-
-struct image_iterator {
-	char *data;
-	int stride; /* bytes */
-};
-
-static void
-image_iter_init(struct image_iterator *it, pixman_image_t *image)
-{
-	pixman_format_code_t fmt;
-
-	it->stride = pixman_image_get_stride(image);
-	it->data = (void *)pixman_image_get_data(image);
-
-	fmt = pixman_image_get_format(image);
-	assert(PIXMAN_FORMAT_BPP(fmt) == 32);
-}
-
-static uint32_t *
-image_iter_get_row(struct image_iterator *it, int y)
-{
-	return (uint32_t *)(it->data + y * it->stride);
 }
 
 struct pixel_diff_stat {
@@ -1333,21 +1369,18 @@ check_images_match(pixman_image_t *img_a, pixman_image_t *img_b,
 {
 	struct range fuzz = range_get(prec);
 	struct pixel_diff_stat diffstat = {};
-	struct image_iterator it_a;
-	struct image_iterator it_b;
+	struct image_header ih_a = image_header_from(img_a);
+	struct image_header ih_b = image_header_from(img_b);
 	pixman_box32_t box;
 	int x, y;
 	uint32_t *pix_a;
 	uint32_t *pix_b;
 
-	box = image_check_get_roi(img_a, img_b, clip_rect);
-
-	image_iter_init(&it_a, img_a);
-	image_iter_init(&it_b, img_b);
+	box = image_check_get_roi(&ih_a, &ih_b, clip_rect);
 
 	for (y = box.y1; y < box.y2; y++) {
-		pix_a = image_iter_get_row(&it_a, y) + box.x1;
-		pix_b = image_iter_get_row(&it_b, y) + box.x1;
+		pix_a = image_header_get_row_u32(&ih_a, y) + box.x1;
+		pix_b = image_header_get_row_u32(&ih_b, y) + box.x1;
 
 		for (x = box.x1; x < box.x2; x++) {
 			if (!fuzzy_match_pixels(*pix_a, *pix_b,
@@ -1417,11 +1450,9 @@ visualize_image_difference(pixman_image_t *img_a, pixman_image_t *img_b,
 	struct pixel_diff_stat diffstat = {};
 	pixman_image_t *diffimg;
 	pixman_image_t *shade;
-	struct image_iterator it_a;
-	struct image_iterator it_b;
-	struct image_iterator it_d;
-	int width;
-	int height;
+	struct image_header ih_a = image_header_from(img_a);
+	struct image_header ih_b = image_header_from(img_b);
+	struct image_header ih_d;
 	pixman_box32_t box;
 	int x, y;
 	uint32_t *pix_a;
@@ -1429,32 +1460,28 @@ visualize_image_difference(pixman_image_t *img_a, pixman_image_t *img_b,
 	uint32_t *pix_d;
 	pixman_color_t shade_color = { 0, 0, 0, 32768 };
 
-	width = pixman_image_get_width(img_a);
-	height = pixman_image_get_height(img_a);
-	box = image_check_get_roi(img_a, img_b, clip_rect);
+	box = image_check_get_roi(&ih_a, &ih_b, clip_rect);
 
 	diffimg = pixman_image_create_bits_no_clear(PIXMAN_x8r8g8b8,
-						    width, height, NULL, 0);
+						    ih_a.width, ih_a.height,
+						    NULL, 0);
+	ih_d = image_header_from(diffimg);
 
 	/* Fill diffimg with a black-shaded copy of img_a, and then fill
 	 * the clip_rect area with original img_a.
 	 */
 	shade = pixman_image_create_solid_fill(&shade_color);
 	pixman_image_composite32(PIXMAN_OP_SRC, img_a, shade, diffimg,
-				 0, 0, 0, 0, 0, 0, width, height);
+				 0, 0, 0, 0, 0, 0, ih_a.width, ih_a.height);
 	pixman_image_unref(shade);
 	pixman_image_composite32(PIXMAN_OP_SRC, img_a, NULL, diffimg,
 				 box.x1, box.y1, 0, 0, box.x1, box.y1,
 				 box.x2 - box.x1, box.y2 - box.y1);
 
-	image_iter_init(&it_a, img_a);
-	image_iter_init(&it_b, img_b);
-	image_iter_init(&it_d, diffimg);
-
 	for (y = box.y1; y < box.y2; y++) {
-		pix_a = image_iter_get_row(&it_a, y) + box.x1;
-		pix_b = image_iter_get_row(&it_b, y) + box.x1;
-		pix_d = image_iter_get_row(&it_d, y) + box.x1;
+		pix_a = image_header_get_row_u32(&ih_a, y) + box.x1;
+		pix_b = image_header_get_row_u32(&ih_b, y) + box.x1;
+		pix_d = image_header_get_row_u32(&ih_d, y) + box.x1;
 
 		for (x = box.x1; x < box.x2; x++) {
 			if (fuzzy_match_pixels(*pix_a, *pix_b,
@@ -1490,16 +1517,12 @@ write_image_as_png(pixman_image_t *image, const char *fname)
 {
 	cairo_surface_t *cairo_surface;
 	cairo_status_t status;
-	cairo_format_t fmt;
+	struct image_header ih = image_header_from(image);
+	cairo_format_t fmt = format_pixman2cairo(ih.pixman_format);
 
-	fmt = format_pixman2cairo(pixman_image_get_format(image));
-
-	cairo_surface = cairo_image_surface_create_for_data(
-			(void *)pixman_image_get_data(image),
-			fmt,
-			pixman_image_get_width(image),
-			pixman_image_get_height(image),
-			pixman_image_get_stride(image));
+	cairo_surface = cairo_image_surface_create_for_data(ih.data, fmt,
+							    ih.width, ih.height,
+							    ih.stride_bytes);
 
 	status = cairo_surface_write_to_png(cairo_surface, fname);
 	if (status != CAIRO_STATUS_SUCCESS) {
@@ -1514,25 +1537,21 @@ write_image_as_png(pixman_image_t *image, const char *fname)
 	return true;
 }
 
-static pixman_image_t *
+pixman_image_t *
 image_convert_to_a8r8g8b8(pixman_image_t *image)
 {
 	pixman_image_t *ret;
-	int width;
-	int height;
+	struct image_header ih = image_header_from(image);
 
-	if (pixman_image_get_format(image) == PIXMAN_a8r8g8b8)
+	if (ih.pixman_format == PIXMAN_a8r8g8b8)
 		return pixman_image_ref(image);
 
-	width = pixman_image_get_width(image);
-	height = pixman_image_get_height(image);
-
-	ret = pixman_image_create_bits_no_clear(PIXMAN_a8r8g8b8, width, height,
-						NULL, 0);
+	ret = pixman_image_create_bits_no_clear(PIXMAN_a8r8g8b8,
+						ih.width, ih.height, NULL, 0);
 	assert(ret);
 
 	pixman_image_composite32(PIXMAN_OP_SRC, image, NULL, ret,
-				 0, 0, 0, 0, 0, 0, width, height);
+				 0, 0, 0, 0, 0, 0, ih.width, ih.height);
 
 	return ret;
 }
@@ -1601,45 +1620,163 @@ load_image_from_png(const char *fname)
 	return converted;
 }
 
+struct output_capturer {
+	int width;
+	int height;
+	uint32_t drm_format;
+
+	struct weston_capture_v1 *factory;
+	struct weston_capture_source_v1 *source;
+
+	bool complete;
+};
+
+static void
+output_capturer_handle_format(void *data,
+			      struct weston_capture_source_v1 *proxy,
+			      uint32_t drm_format)
+{
+	struct output_capturer *capt = data;
+
+	capt->drm_format = drm_format;
+}
+
+static void
+output_capturer_handle_size(void *data,
+			    struct weston_capture_source_v1 *proxy,
+			    int32_t width, int32_t height)
+{
+	struct output_capturer *capt = data;
+
+	capt->width = width;
+	capt->height = height;
+}
+
+static void
+output_capturer_handle_complete(void *data,
+			        struct weston_capture_source_v1 *proxy)
+{
+	struct output_capturer *capt = data;
+
+	capt->complete = true;
+}
+
+static void
+output_capturer_handle_retry(void *data,
+			     struct weston_capture_source_v1 *proxy)
+{
+	assert(0 && "output capture retry in tests indicates a race");
+}
+
+static void
+output_capturer_handle_failed(void *data,
+			      struct weston_capture_source_v1 *proxy,
+			      const char *msg)
+{
+	testlog("output capture failed: %s", msg ? msg : "?");
+	assert(0 && "output capture failed");
+}
+
+static const struct weston_capture_source_v1_listener output_capturer_source_handlers = {
+	.format = output_capturer_handle_format,
+	.size = output_capturer_handle_size,
+	.complete = output_capturer_handle_complete,
+	.retry = output_capturer_handle_retry,
+	.failed = output_capturer_handle_failed,
+};
+
+struct buffer *
+client_capture_output(struct client *client,
+		      struct output *output,
+		      enum weston_capture_v1_source src)
+{
+	struct output_capturer capt = {};
+	struct buffer *buf;
+
+	capt.factory = bind_to_singleton_global(client,
+						&weston_capture_v1_interface,
+						1);
+
+	capt.source = weston_capture_v1_create(capt.factory,
+					       output->wl_output, src);
+	weston_capture_source_v1_add_listener(capt.source,
+					      &output_capturer_source_handlers,
+					      &capt);
+
+	client_roundtrip(client);
+
+	buf = create_shm_buffer(client,
+				capt.width, capt.height, capt.drm_format);
+
+	weston_capture_source_v1_capture(capt.source, buf->proxy);
+	while (!capt.complete)
+		assert(wl_display_dispatch(client->wl_display) >= 0);
+
+	weston_capture_source_v1_destroy(capt.source);
+	weston_capture_v1_destroy(capt.factory);
+
+	return buf;
+}
+
 /**
  * Take screenshot of a single output
  *
- * Requests a screenshot from the server of the output that the
- * client appears on. This implies that the compositor goes through an output
+ * Requests a screenshot from the server of the output specified
+ * in output_name. This implies that the compositor goes through an output
  * repaint to provide the screenshot before this function returns. This
  * function is therefore both a server roundtrip and a wait for a repaint.
  *
+ * The resulting buffer shall contain a copy of the framebuffer contents,
+ * the output area only, that is, without borders (output decorations).
+ * The shot is in output physical pixels, with the output scale and
+ * orientation rather than scale=1 or orientation=normal. The pixel format
+ * is ensured to be PIXMAN_a8r8g8b8.
+ *
+ * @param client a client instance, as created by create_client()
+ * @param output_name the name of the output, as specified by wl_output.name
  * @returns A new buffer object, that should be freed with buffer_destroy().
  */
 struct buffer *
-capture_screenshot_of_output(struct client *client)
+capture_screenshot_of_output(struct client *client, const char *output_name)
 {
-	struct buffer *buffer;
+	struct image_header ih;
+	struct buffer *shm;
+	struct buffer *buf;
+	struct output *output = NULL;
 
-	buffer = create_shm_buffer_a8r8g8b8(client,
-					    client->output->width,
-					    client->output->height);
+	if (output_name) {
+		struct output *output_iter;
 
-	client->test->buffer_copy_done = 0;
-	weston_test_capture_screenshot(client->test->weston_test,
-				       client->output->wl_output,
-				       buffer->proxy);
-	while (client->test->buffer_copy_done == 0)
-		if (wl_display_dispatch(client->wl_display) < 0)
-			break;
+		wl_list_for_each(output_iter, &client->output_list, link) {
+			if (!strcmp(output_name, output_iter->name)) {
+				output = output_iter;
+				break;
+			}
+		}
 
-	/* FIXME: Document somewhere the orientation the screenshot is taken
-	 * and how the clip coords are interpreted, in case of scaling/transform.
-	 * If we're using read_pixels() just make sure it is documented somewhere.
-	 * Protocol docs in the XML, comparison function docs in Doxygen style.
-	 */
+		assert(output);
+	} else {
+		output = client->output;
+	}
 
-	return buffer;
+	shm = client_capture_output(client, output,
+				    WESTON_CAPTURE_V1_SOURCE_FRAMEBUFFER);
+	ih = image_header_from(shm->image);
+
+	if (ih.pixman_format == PIXMAN_a8r8g8b8)
+		return shm;
+
+	buf = create_pixman_buffer(ih.width, ih.height, PIXMAN_a8r8g8b8);
+	pixman_image_composite32(PIXMAN_OP_SRC, shm->image, NULL, buf->image,
+				 0, 0, 0, 0, 0, 0, ih.width, ih.height);
+
+	buffer_destroy(shm);
+	return buf;
 }
 
 static void
 write_visual_diff(pixman_image_t *ref_image,
-		  struct buffer *shot,
+		  pixman_image_t *shot,
 		  const struct rectangle *clip,
 		  const char *test_name,
 		  int seq_no,
@@ -1654,7 +1791,7 @@ write_visual_diff(pixman_image_t *ref_image,
 	assert(ret >= 0);
 
 	fname = screenshot_output_filename(ext_test_name, seq_no);
-	diff = visualize_image_difference(ref_image, shot->image, clip, fuzz);
+	diff = visualize_image_difference(ref_image, shot, clip, fuzz);
 	write_image_as_png(diff, fname);
 
 	pixman_image_unref(diff);
@@ -1663,52 +1800,50 @@ write_visual_diff(pixman_image_t *ref_image,
 }
 
 /**
- * Take a screenshot and verify its contents
+ * Verify image contents
  *
- * Takes a screenshot and writes the image into a PNG file named with
- * get_test_name() and seq_no. Compares the contents to the given reference
+ * Compares the contents of the given shot to the given reference
  * image over the given clip rectangle, reports whether they match to the
- * test log, and if they do not match writes a visual diff into a PNG file.
+ * test log, and if they do not match writes a visual diff into a PNG file
+ * and the screenshot into another PNG file named with get_test_name() and
+ * seq_no.
  *
- * The compositor output size and the reference image size must both contain
+ * The shot image size and the reference image size must both contain
  * the clip rectangle.
  *
- * This function uses the pixel value allowed fuzz approriate for GL-renderer
+ * This function uses the pixel value allowed fuzz appropriate for GL-renderer
  * with 8 bits per channel data.
  *
- * \param client The client, for connecting to the compositor.
+ * \param shot The image to be verified, usually a screenshot.
  * \param ref_image The reference image file basename, without sequence number
  * and .png suffix.
  * \param ref_seq_no The reference image sequence number.
  * \param clip The region of interest, or NULL for comparing the whole
  * images.
  * \param seq_no Test sequence number, for writing output files.
- * \return True if the screen contents matches the reference image,
- * false otherwise.
+ * \return True if the shot matches the reference image, false otherwise.
  *
  * For bootstrapping, ref_image can be NULL or the file can be missing.
  * In that case the screenshot file is written but no comparison is performed,
  * and false is returned.
+ *
+ * \sa verify_screen_content
  */
 bool
-verify_screen_content(struct client *client,
-		      const char *ref_image,
-		      int ref_seq_no,
-		      const struct rectangle *clip,
-		      int seq_no)
+verify_image(pixman_image_t *shot,
+	     const char *ref_image,
+	     int ref_seq_no,
+	     const struct rectangle *clip,
+	     int seq_no)
 {
 	const char *test_name = get_test_name();
 	const struct range gl_fuzz = { -3, 4 };
-	struct buffer *shot;
 	pixman_image_t *ref = NULL;
 	char *ref_fname = NULL;
 	char *shot_fname;
-	bool match;
+	bool match = false;
 
-	shot = capture_screenshot_of_output(client);
-	assert(shot);
 	shot_fname = screenshot_output_filename(test_name, seq_no);
-	write_image_as_png(shot->image, shot_fname);
 
 	if (ref_image) {
 		ref_fname = screenshot_reference_filename(ref_image, ref_seq_no);
@@ -1716,7 +1851,7 @@ verify_screen_content(struct client *client,
 	}
 
 	if (ref) {
-		match = check_images_match(ref, shot->image, clip, &gl_fuzz);
+		match = check_images_match(ref, shot, clip, &gl_fuzz);
 		testlog("Verify reference image %s vs. shot %s: %s\n",
 			ref_fname, shot_fname, match ? "PASS" : "FAIL");
 
@@ -1728,12 +1863,46 @@ verify_screen_content(struct client *client,
 		pixman_image_unref(ref);
 	} else {
 		testlog("No reference image, shot %s: FAIL\n", shot_fname);
-		match = false;
 	}
 
+	if (!match)
+		write_image_as_png(shot, shot_fname);
+
 	free(ref_fname);
-	buffer_destroy(shot);
 	free(shot_fname);
+
+	return match;
+}
+
+/**
+ * Take a screenshot and verify its contents
+ *
+ * Takes a screenshot and calls verify_image() with it.
+ *
+ * \param client The client, for connecting to the compositor.
+ * \param ref_image See verify_image().
+ * \param ref_seq_no See verify_image().
+ * \param clip See verify_image().
+ * \param seq_no See verify_image().
+ * \param output_name the output name as specified by wl_output.name. If NULL,
+ * this is the last wl_output advertised by wl_registry.
+ * \return True if the screen contents matches the reference image,
+ * false otherwise.
+ */
+bool
+verify_screen_content(struct client *client,
+		      const char *ref_image,
+		      int ref_seq_no,
+		      const struct rectangle *clip,
+		      int seq_no, const char *output_name)
+{
+	struct buffer *shot;
+	bool match;
+
+	shot = capture_screenshot_of_output(client, output_name);
+	assert(shot);
+	match = verify_image(shot->image, ref_image, ref_seq_no, clip, seq_no);
+	buffer_destroy(shot);
 
 	return match;
 }
@@ -1857,7 +2026,7 @@ client_create_viewport(struct client *client)
  * \param color The color to use.
  */
 void
-fill_image_with_color(pixman_image_t *image, pixman_color_t *color)
+fill_image_with_color(pixman_image_t *image, const pixman_color_t *color)
 {
 	pixman_image_t *solid;
 	int width;
