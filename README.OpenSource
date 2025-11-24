@@ -1,0 +1,11 @@
+[
+    {
+        "Name": "weston",                  
+        "License": "MIT",         
+        "License File": "COPYING",    
+        "Version Number": "ccf29cb237c3ed09c5f370f35239c93d07abfdd7",
+        "Owner": "huamengzheng@huawei.com",
+        "Upstream URL": "https://chromium.googlesource.com/external/anongit.freedesktop.org/git/wayland/weston.git@ccf29cb237c3ed09c5f370f35239c93d07abfdd7",  
+        "Description": "第三方软件weston"           
+    }
+]
